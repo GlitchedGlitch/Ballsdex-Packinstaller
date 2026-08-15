@@ -119,7 +119,6 @@ class PackagesCog(commands.Cog):
 
     @commands.group(
         name="package",
-        aliases=["pkg"],
         invoke_without_command=True,
     )
     @commands.is_owner()
