@@ -5,7 +5,7 @@ Please don't install yet, this is still in development
 ```toml
 # PackInstaller
 [[ballsdex.packages]]
-location = "git+https://github.com/GlitchedGlitch/Ballsdex-Packinstaller.git#dev"
+location = "git+https://github.com/GlitchedGlitch/Ballsdex-Packinstaller.git@dev"
 path = "packinstaller"
 enabled = true
 ```
