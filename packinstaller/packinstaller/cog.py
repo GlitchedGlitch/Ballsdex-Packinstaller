@@ -192,7 +192,7 @@ class PackagesCog(commands.Cog):
         except OSError as e:
             steps[2] = (steps[2][0], False)
             await msg.edit(embed=_progress_embed("Installation failed", steps, discord.Color.red()))
-            await ctx.send(f"Could not write to `extra.toml`: `{e.strerror`")
+            await ctx.send(f"Could not write to `extra.toml`: `{e.strerror}`")
             return
 
         await upd(2)
