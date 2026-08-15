@@ -352,14 +352,14 @@ class PackagesCog(commands.Cog):
 
             if meta is None:
                 steps[0] = (steps[0][0], False)
-                await pkg_msg.edit(embed=_progress_embed(f"Update failed — {path}", steps, discord.Color.red()))
+                await pkg_msg.edit(embed=_progress_embed(f"Update failed - {path}", steps, discord.Color.red()))
                 await ctx.send(f"{path}: {err}")
                 continue
 
             ok, output = await uv_install(meta.raw_url)
             if not ok:
                 steps[0] = (steps[0][0], False)
-                await pkg_msg.edit(embed=_progress_embed(f"Update failed — {path}", steps, discord.Color.red()))
+                await pkg_msg.edit(embed=_progress_embed(f"Update failed - {path}", steps, discord.Color.red()))
                 truncated = output[-800:] if len(output) > 800 else output
                 await ctx.send(f"`{path}` uv failed:\n```\n{truncated}\n```")
                 continue
@@ -371,7 +371,7 @@ class PackagesCog(commands.Cog):
                     update_package_location(path, meta.raw_url)
             except OSError as e:
                 steps[1] = (steps[1][0], False)
-                await pkg_msg.edit(embed=_progress_embed(f"Update failed — {path}", steps, discord.Color.red()))
+                await pkg_msg.edit(embed=_progress_embed(f"Update failed - {path}", steps, discord.Color.red()))
                 await ctx.send(f"`{path}` extra.toml write failed: `{e.strerror}`")
                 continue
 
@@ -384,7 +384,7 @@ class PackagesCog(commands.Cog):
                     await self.bot.load_extension(path)
             except Exception as e:
                 steps[2] = (steps[2][0], False)
-                await pkg_msg.edit(embed=_progress_embed(f"Partial update — {path}", steps, discord.Color.orange()))
+                await pkg_msg.edit(embed=_progress_embed(f"Partial update - {path}", steps, discord.Color.orange()))
                 await ctx.send(f"`{path}` updated but reload failed:\n```\n{e}\n```")
                 log.warning(
                     f"{ctx.author} updated {path} to {info.latest_tag} but reload failed: {e}",
@@ -455,7 +455,7 @@ class PackagesCog(commands.Cog):
         )
         footer = f"{len(packages)} package(s)"
         if updates_available:
-            footer += f" • {updates_available} update(s) available — run `{settings.prefix}package update`"
+            footer += f" • {updates_available} update(s) available - run `{settings.prefix}package update`"
         embed.set_footer(text=footer)
         await msg.edit(content=None, embed=embed)
 
