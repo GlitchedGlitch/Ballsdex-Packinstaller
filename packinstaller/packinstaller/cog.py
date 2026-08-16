@@ -11,10 +11,15 @@ import aiohttp
 import discord
 from discord.ext import commands
 
+from settings.models import settings
+
 from .github import (
+    RateLimitError,
     VersionInfo,
     check_versions,
+    discover_extension,
     uv_install,
+    uv_reinstall,
     validate_and_fetch_meta,
 )
 from .toml_utils import (
@@ -25,8 +30,6 @@ from .toml_utils import (
     remove_package,
     update_package_location,
 )
-
-from settings.models import settings
 
 if TYPE_CHECKING:
     from ballsdex.core.bot import BallsDexBot
@@ -40,8 +43,7 @@ def _bar(current: int, total: int) -> str:
     if total == 0:
         return f"`{'░' * BAR_LEN}` 0%"
     filled = round(BAR_LEN * current / total)
-    pct = round(100 * current / total)
-    return f"`{BAR_FILLED * filled}{BAR_EMPTY * (BAR_LEN - filled)}` {pct}%"
+    return f"`{BAR_FILLED * filled}{BAR_EMPTY * (BAR_LEN - filled)}` {round(100 * current / total)}%"
 
 
 def _progress_embed(
@@ -59,14 +61,24 @@ def _progress_embed(
     )
 
 
-# ── Interactive update select view ────────────────────────────────────────────
+def _status_icon(loaded: bool, enabled: bool, gh_available: bool | None = True) -> str:
+    if not enabled:
+        return "⏸️"
+    if gh_available is False:
+        return "⚠️"
+    if loaded:
+        return "✅"
+    return "🔴"
+
+
+# ── Interactive update views ──────────────────────────────────────────────────
 
 class UpdateSelect(discord.ui.Select):
     def __init__(self, updates: list[VersionInfo]):
         options = [
             discord.SelectOption(
                 label=v.path,
-                description=f"{v.installed_tag} → {v.latest_tag}",
+                description=f"{v.installed_tag} -> {v.latest_tag}",
                 value=v.path,
             )
             for v in updates
@@ -83,13 +95,12 @@ class UpdateSelect(discord.ui.Select):
         await interaction.response.defer()
 
 
-class UpdateView(discord.ui.View):
-    def __init__(self, updates: list[VersionInfo], owner_id: int):
-        super().__init__(timeout=120)
-        self.selected: list[str] = []
+class UpdateConfirmView(discord.ui.View):
+    def __init__(self, selected: list[str], owner_id: int):
+        super().__init__(timeout=60)
+        self.selected = selected
         self.owner_id = owner_id
         self.confirmed = False
-        self.add_item(UpdateSelect(updates))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -97,7 +108,7 @@ class UpdateView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Update Selected", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Confirm Update", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.confirmed = True
         await interaction.response.defer()
@@ -109,18 +120,46 @@ class UpdateView(discord.ui.View):
         self.stop()
 
 
+class UpdateSelectView(discord.ui.View):
+    def __init__(self, updates: list[VersionInfo], owner_id: int):
+        super().__init__(timeout=120)
+        self.selected: list[str] = []
+        self.owner_id = owner_id
+        self.proceed = False
+        self.add_item(UpdateSelect(updates))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This menu is not for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Next ->", style=discord.ButtonStyle.primary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.selected:
+            await interaction.response.send_message(
+                "Select at least one package first.", ephemeral=True
+            )
+            return
+        self.proceed = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        self.stop()
+
+
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
-class PackagesCog(commands.Cog, name="PackInstaller"):
+class PackagesCog(commands.Cog):
     """PackInstaller - manage BallsDex v3 packages from Discord."""
 
     def __init__(self, bot: "BallsDexBot"):
         self.bot = bot
 
-    @commands.group(
-        name="package",
-        invoke_without_command=True,
-    )
+    @commands.group(name="package", invoke_without_command=True)
     @commands.is_owner()
     async def package(self, ctx: commands.Context):
         """
@@ -134,12 +173,12 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
     @commands.is_owner()
     async def install(self, ctx: commands.Context, *, url: str):
         """
-        Install a BallsDex package from a GitHub repository.
+        Install a BallsDex package from GitHub.
 
         Parameters
         ----------
         url: str
-            The GitHub repository URL or git+ URL of the package to install.
+            GitHub URL, git+ or subdirectories.
         """
         steps: list[tuple[str, bool | None]] = [
             ("Validating package", None),
@@ -166,7 +205,10 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
         if package_exists(meta.path):
             steps[0] = (steps[0][0], False)
             await msg.edit(embed=_progress_embed("Installation failed", steps, discord.Color.red()))
-            await ctx.send(f"`{meta.path}` is already installed. Use `{settings.prefix}package update` instead.")
+            await ctx.send(
+                f"`{meta.path}` is already installed. "
+                f"Use `{settings.prefix}package update` instead."
+            )
             return
 
         await upd(0)
@@ -183,36 +225,42 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
         await upd(1)
 
         # extra.toml
+        toml_written = False
         try:
             add_package(
                 {"location": meta.raw_url, "path": meta.path, "enabled": True},
                 comment=meta.name,
             )
-        except OSError as e:
-            steps[2] = (steps[2][0], False)
-            await msg.edit(embed=_progress_embed("Installation failed", steps, discord.Color.red()))
-            await ctx.send(f"Could not write to `extra.toml`: `{e.strerror}`")
-            return
+            toml_written = True
+        except OSError:
+            pass
 
-        await upd(2)
+        await upd(2, success=toml_written)
 
         # load extension
+        extension = meta.extension or discover_extension(meta.path)
         try:
-            await self.bot.load_extension(meta.path)
+            await self.bot.load_extension(extension)
         except Exception as e:
             steps[3] = (steps[3][0], False)
             await msg.edit(embed=_progress_embed("Partial install", steps, discord.Color.orange()))
             await ctx.send(
-                f"Written to `extra.toml` but failed to load live:\n```\n{e}\n```\n"
-                "It will load automatically on the next rebuild and restart."
+                f"Package installed but failed to load `{extension}`:\n```\n{e}\n```\n"
+                "It will load on the next restart."
             )
             log.warning(
-                f"{ctx.author} installed {meta.name} ({meta.path}) but load failed: {e}",
+                f"{ctx.author} installed {meta.name} ({extension}) but load failed: {e}",
                 extra={"webhook": True},
             )
             return
 
         await upd(3)
+
+        toml_note = (
+            "" if toml_written
+            else "\nCould not write to `extra.toml` (read-only). "
+                 "This install is **runtime-only** and will not survive a rebuild."
+        )
 
         await msg.edit(
             embed=discord.Embed(
@@ -221,20 +269,22 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
                     f"**{meta.name}** `{meta.version}`\n"
                     f"{meta.description}\n\n"
                     f"• Path: `{meta.path}`\n"
+                    f"• Extension: `{extension}`\n"
                     f"• Source: `{meta.raw_url}`"
+                    f"{toml_note}"
                 ),
                 color=discord.Color.green(),
             )
         )
         log.info(
             f"{ctx.author} ({ctx.author.id}) installed {meta.name} "
-            f"({meta.path}) v{meta.version} from {meta.raw_url}",
+            f"({extension}) v{meta.version}",
             extra={"webhook": True},
         )
 
     # ── uninstall ─────────────────────────────────────────────────────────────
 
-    @package.command(name="uninstall", aliases=["remove"])
+    @package.command(name="uninstall")
     @commands.is_owner()
     async def uninstall(self, ctx: commands.Context, package: str):
         """
@@ -260,29 +310,29 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
             await msg.edit(embed=_progress_embed("Removing package…", steps, discord.Color.blurple()))
 
         # unload
-        try:
-            await self.bot.unload_extension(package)
-        except Exception:
-            pass  # may not be loaded
+        extension = discover_extension(package)
+        for candidate in [extension, package]:
+            try:
+                await self.bot.unload_extension(candidate)
+                break
+            except Exception:
+                pass
         await upd(0)
 
-        # rmeove from extra.toml
+        # remove
         try:
             remove_package(package)
+            await upd(1)
         except OSError as e:
             steps[1] = (steps[1][0], False)
             await msg.edit(embed=_progress_embed("Removal failed", steps, discord.Color.red()))
             await ctx.send(f"Could not write to `extra.toml`: `{e.strerror}`")
             return
 
-        await upd(1)
-
         await msg.edit(
             embed=discord.Embed(
                 title="Package Removed",
-                description=(
-                    f"Package `{package}` unloaded and removed from `extra.toml`.\n\n"
-                ),
+                description=(f"`{package}` unloaded and removed"),
                 color=discord.Color.red(),
             )
         )
@@ -297,113 +347,179 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
     @commands.is_owner()
     async def update(self, ctx: commands.Context):
         """
-        Select and update installed BallsDex packages.
+        Interactive menu to select and update installed packages.
         """
-        packages = read_packages()
+        packages = [p for p in read_packages() if p.get("location", "").startswith("git+https://github.com/")]
         if not packages:
-            await ctx.send("No packages registered in `extra.toml`.")
+            await ctx.send("No GitHub-sourced packages registered in `extra.toml`.")
             return
 
         checking = await ctx.send("Checking for updates…")
-        async with aiohttp.ClientSession() as session:
-            version_infos = await check_versions(session, packages)
+        try:
+            async with aiohttp.ClientSession() as session:
+                version_infos = await check_versions(session, packages)
+        except Exception as e:
+            await checking.edit(content=f"Failed to check versions: {e}")
+            return
+
         await checking.delete()
 
         updates = [v for v in version_infos if v.has_update]
         if not updates:
-            await ctx.send("All packages are up to date.")
+            gh_unavailable = [v for v in version_infos if not v.github_available]
+            note = (
+                f"\n{len(gh_unavailable)} package(s) could not be checked (GitHub unavailable)."
+                if gh_unavailable else ""
+            )
+            await ctx.send(f"All packages are up to date!{note}")
             return
 
-        lines = [f"• **{v.path}** `{v.installed_tag}` → `{v.latest_tag}`" for v in updates]
-        embed = discord.Embed(
+        # Selection step
+        lines = [f"• **{v.path}** `{v.installed_tag}` -> `{v.latest_tag}`" for v in updates]
+        select_embed = discord.Embed(
             title=f"{len(updates)} Update(s) Available!",
             description="\n".join(lines),
             color=discord.Color.blurple(),
         )
-        view = UpdateView(updates, ctx.author.id)
-        msg = await ctx.send(embed=embed, view=view)
-        await view.wait()
+        select_view = UpdateSelectView(updates, ctx.author.id)
+        select_msg = await ctx.send(embed=select_embed, view=select_view)
+        await select_view.wait()
 
-        if not view.confirmed or not view.selected:
-            await msg.edit(content="Update cancelled.", embed=None, view=None)
+        if not select_view.proceed or not select_view.selected:
+            await select_msg.edit(content="Update cancelled.", embed=None, view=None)
             return
 
-        await msg.edit(content=None, embed=None, view=None)
-        selected_map = {v.path: v for v in updates}
+        # Confirmation step
+        selected_infos = [v for v in updates if v.path in select_view.selected]
+        conf_lines = [f"• **{v.path}** `{v.installed_tag}` -> `{v.latest_tag}`" for v in selected_infos]
+        conf_embed = discord.Embed(
+            title="Confirm Update",
+            description="Update the following packages?\n\n" + "\n".join(conf_lines),
+            color=discord.Color.orange(),
+        )
+        conf_view = UpdateConfirmView(select_view.selected, ctx.author.id)
+        await select_msg.edit(embed=conf_embed, view=conf_view)
+        await conf_view.wait()
 
-        for path in view.selected:
-            info = selected_map[path]
+        if not conf_view.confirmed:
+            await select_msg.edit(content="Update cancelled.", embed=None, view=None)
+            return
+
+        await select_msg.edit(embed=None, view=None, content="Updating packages…")
+
+        # Update 
+        results: list[tuple[str, bool, str]] = []
+
+        for info in selected_infos:
+            path = info.path
             current_location = get_package_location(path) or ""
 
             steps: list[tuple[str, bool | None]] = [
-                (f"Installing {path} {info.latest_tag}", None),
+                (f"Installing {path} {info.latest_tag} (--reinstall-package)", None),
+                ("Verifying installation", None),
                 ("Updating extra.toml", None),
                 ("Reloading extension", None),
             ]
-            pkg_msg = await ctx.send(embed=_progress_embed(f"Updating {path}…", steps, discord.Color.blurple()))
+            pkg_msg = await ctx.send(
+                embed=_progress_embed(f"Updating {path}…", steps, discord.Color.blurple())
+            )
 
             async def upd(i: int, success: bool = True, m=pkg_msg, s=steps, p=path):
                 s[i] = (s[i][0], success)
                 await m.edit(embed=_progress_embed(f"Updating {p}…", s, discord.Color.blurple()))
 
+            # Re-validate url
             async with aiohttp.ClientSession() as session:
                 meta, err = await validate_and_fetch_meta(session, current_location)
 
             if meta is None:
                 steps[0] = (steps[0][0], False)
                 await pkg_msg.edit(embed=_progress_embed(f"Update failed - {path}", steps, discord.Color.red()))
-                await ctx.send(f"{path}: {err}")
+                results.append((path, False, err))
                 continue
 
-            ok, output = await uv_install(meta.raw_url)
+            # Install
+            ok, output = await uv_reinstall(meta.raw_url, meta.name)
             if not ok:
                 steps[0] = (steps[0][0], False)
                 await pkg_msg.edit(embed=_progress_embed(f"Update failed - {path}", steps, discord.Color.red()))
                 truncated = output[-800:] if len(output) > 800 else output
                 await ctx.send(f"`{path}` uv failed:\n```\n{truncated}\n```")
+                results.append((path, False, "uv pip install failed"))
                 continue
 
             await upd(0)
 
+            # Verify
+            extension = meta.extension or discover_extension(path)
+            try:
+                import importlib
+                importlib.import_module(extension)
+                await upd(1)
+            except Exception as e:
+                steps[1] = (steps[1][0], False)
+                await pkg_msg.edit(embed=_progress_embed(f"Update failed - {path}", steps, discord.Color.red()))
+                results.append((path, False, f"Verification failed: {e}"))
+                continue
+
+            # Update file
+            toml_updated = False
             try:
                 if meta.raw_url != current_location:
                     update_package_location(path, meta.raw_url)
-            except OSError as e:
-                steps[1] = (steps[1][0], False)
-                await pkg_msg.edit(embed=_progress_embed(f"Update failed - {path}", steps, discord.Color.red()))
-                await ctx.send(f"`{path}` extra.toml write failed: `{e.strerror}`")
-                continue
+                toml_updated = True
+            except OSError:
+                pass
+            await upd(2, success=toml_updated)
 
-            await upd(1)
-
+            # Reload
             try:
-                if path in self.bot.extensions:
-                    await self.bot.reload_extension(path)
+                if extension in self.bot.extensions:
+                    await self.bot.reload_extension(extension)
                 else:
-                    await self.bot.load_extension(path)
+                    await self.bot.load_extension(extension)
+                await upd(3)
             except Exception as e:
-                steps[2] = (steps[2][0], False)
-                await pkg_msg.edit(embed=_progress_embed(f"Partial update - {path}", steps, discord.Color.orange()))
-                await ctx.send(f"`{path}` updated but reload failed:\n```\n{e}\n```")
+                steps[3] = (steps[3][0], False)
+                await pkg_msg.edit(
+                    embed=_progress_embed(f"Partial update - {path}", steps, discord.Color.orange())
+                )
+                results.append((path, False, f"Reload failed: {e}"))
                 log.warning(
                     f"{ctx.author} updated {path} to {info.latest_tag} but reload failed: {e}",
                     extra={"webhook": True},
                 )
                 continue
 
-            await upd(2)
+            not_persistent = "" if toml_updated else " *(runtime-only - extra.toml not writable)*"
             await pkg_msg.edit(
                 embed=discord.Embed(
                     title=f"{path} Updated",
-                    description=f"`{info.installed_tag}` -> `{info.latest_tag}`",
+                    description=f"`{info.installed_tag}` -> `{info.latest_tag}`{not_persistent}",
                     color=discord.Color.green(),
                 )
             )
+            results.append((path, True, f"{info.installed_tag} -> {info.latest_tag}"))
             log.info(
                 f"{ctx.author} ({ctx.author.id}) updated {path} "
                 f"from {info.installed_tag} to {info.latest_tag}",
                 extra={"webhook": True},
             )
+
+        # Summary
+        success_count = sum(1 for _, ok, _ in results if ok)
+        fail_count = len(results) - success_count
+        summary_lines = [
+            f"{'✅' if ok else '❌'} **{p}** - {msg}"
+            for p, ok, msg in results
+        ]
+        await ctx.send(
+            embed=discord.Embed(
+                title=f"Update complete - {success_count} succeeded, {fail_count} failed",
+                description="\n".join(summary_lines),
+                color=discord.Color.green() if not fail_count else discord.Color.orange(),
+            )
+        )
 
     # ── list ──────────────────────────────────────────────────────────────────
 
@@ -411,35 +527,59 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
     @commands.is_owner()
     async def list_packages(self, ctx: commands.Context):
         """
-        List all installed BallsDex packages..
+        List all installed packages with status.
         """
         packages = read_packages()
         if not packages:
             await ctx.send("No packages registered in `extra.toml`.")
             return
 
-        msg = await ctx.send("Checking versions…")
+        msg = await ctx.send("Checking versions (may be cached)…")
 
-        async with aiohttp.ClientSession() as session:
-            version_infos = await check_versions(session, packages)
+        # Check
+        gh_packages = [p for p in packages if p.get("location", "").startswith("git+https://github.com/")]
+        try:
+            async with aiohttp.ClientSession() as session:
+                version_infos = await check_versions(session, gh_packages)
+        except Exception:
+            version_infos = []
 
         version_map = {v.path: v for v in version_infos}
         lines: list[str] = []
 
         for pkg in packages:
             path = pkg["path"]
-            loaded = path in self.bot.extensions
             enabled = pkg.get("enabled", True)
-
-            status = "✅" if loaded else ("⏸️" if not enabled else "⚠️")
+            location = pkg.get("location", "")
             info = version_map.get(path)
 
-            if info:
-                ver = f"`{info.installed_tag}`"
-                if info.has_update:
-                    ver += f" -> `{info.latest_tag}`"
+            extension = discover_extension(path)
+            loaded = extension in self.bot.extensions or path in self.bot.extensions
+
+            # Status
+            if not enabled:
+                status = "⏸️"
+            elif info and not info.github_available:
+                status = "⚠️"
+            elif loaded:
+                status = "✅"
             else:
-                ver = "`unknown`"
+                status = "🔴"
+
+            # Version string
+            if info:
+                if info.has_update:
+                    ver = f"`{info.installed_tag}` -> `{info.latest_tag}`"
+                elif not info.github_available:
+                    ver = f"`{info.installed_tag}` *(GitHub unavailable)*"
+                else:
+                    ver = f"`{info.installed_tag}`"
+            elif location:
+                from .github import extract_tag_from_location
+                tag = extract_tag_from_location(location)
+                ver = f"`{tag}`" if tag else "`unknown`"
+            else:
+                ver = "`local`"
 
             line = f"{status} **{path}** {ver}"
             if not loaded:
@@ -454,7 +594,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
         )
         footer = f"{len(packages)} package(s)"
         if updates_available:
-            footer += f" • {updates_available} update(s) available - run `{settings.prefix}package update`"
+            footer += f" • {updates_available} update(s)! - run `{settings.prefix}package update`"
         embed.set_footer(text=footer)
         await msg.edit(content=None, embed=embed)
 
@@ -464,13 +604,12 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
     @commands.is_owner()
     async def version(self, ctx: commands.Context, package: str | None = None):
         """
-        View installed and latest versions of BallsDex packages.
+        Check version(s) of installed packages against GitHub.
 
         Parameters
         ----------
         package: str | None
-            The package path to check.
-            If omitted, all installed packages are checked.
+            Package path to check. Omit to check all.
         """
         packages = read_packages()
         if not packages:
@@ -484,26 +623,34 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
                 return
 
         msg = await ctx.send("Checking versions…")
-        async with aiohttp.ClientSession() as session:
-            version_infos = await check_versions(session, packages)
+        try:
+            async with aiohttp.ClientSession() as session:
+                version_infos = await check_versions(session, packages)
+        except RateLimitError as e:
+            await msg.edit(content=f"{e}")
+            return
 
         if not version_infos:
-            await msg.edit(content="No version information available (only GitHub packages can be checked).")
+            await msg.edit(content="No version information available for these packages.")
             return
 
         lines = []
         for v in version_infos:
-            if v.has_update:
-                lines.append(f"**{v.path}**: `{v.installed_tag}` -> `{v.latest_tag}` (update available)")
+            if not v.github_available:
+                lines.append(f"**{v.path}**: `{v.installed_tag}` *(GitHub unavailable)*")
+            elif v.has_update:
+                lines.append(f"**{v.path}**: ~~`{v.installed_tag}`~~ `{v.latest_tag}` - update available!")
             else:
-                lines.append(f"**{v.path}**: `{v.installed_tag}` (up to date)")
+                lines.append(f"**{v.path}**: `{v.installed_tag}` - up to date")
 
-        embed = discord.Embed(
-            title="Package Versions",
-            description="\n".join(lines),
-            color=discord.Color.blurple(),
+        await msg.edit(
+            content=None,
+            embed=discord.Embed(
+                title="Package Versions",
+                description="\n".join(lines),
+                color=discord.Color.blurple(),
+            ),
         )
-        await msg.edit(content=None, embed=embed)
 
     # ── load ──────────────────────────────────────────────────────────────────
 
@@ -516,42 +663,47 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
         Parameters
         ----------
         package: str | None
-            The package path to load.
-            If omitted, all unloaded packages in extra.toml are loaded.
+            Package path to load. Omit to load all unloaded packages.
         """
-        packages = read_packages()
+        packages = [p for p in read_packages() if p.get("enabled", True)]
         if not packages:
-            await ctx.send("No packages registered in `extra.toml`.")
+            await ctx.send("No enabled packages in `extra.toml`.")
             return
 
-        targets = [p for p in packages if p.get("enabled", True)]
         if package:
-            targets = [p for p in targets if p["path"] == package]
-            if not targets:
+            packages = [p for p in packages if p["path"] == package]
+            if not packages:
                 await ctx.send(f"No enabled package with path `{package}` found.")
                 return
 
-        loaded, failed = [], []
-        for pkg in targets:
+        loaded, already, failed = [], [], []
+
+        for pkg in packages:
             path = pkg["path"]
-            if path in self.bot.extensions:
+            extension = discover_extension(path)
+
+            if extension in self.bot.extensions or path in self.bot.extensions:
+                already.append(path)
                 continue
+
             try:
-                await self.bot.load_extension(path)
-                loaded.append(path)
+                await self.bot.load_extension(extension)
+                loaded.append(f"`{path}` (ext: `{extension}`)")
             except Exception as e:
-                failed.append(f"`{path}`: {e}")
-                log.warning(f"Failed to load {path}: {e}", exc_info=True)
+                failed.append(f"`{path}` (`{extension}`): {e}")
+                log.warning(f"Failed to load {extension}: {e}", exc_info=True)
 
         lines = []
         if loaded:
-            lines.append("**Loaded:**\n" + "\n".join(f"`{p}`" for p in loaded))
+            lines.append("**Loaded:**\n" + "\n".join(f"{p}" for p in loaded))
+        if already:
+            lines.append("**Already loaded:**\n" + "\n".join(f"`{p}`" for p in already))
         if failed:
             lines.append("**Failed:**\n" + "\n".join(f"{f}" for f in failed))
-        if not loaded and not failed:
-            lines.append("All packages are already loaded.")
+        if not loaded and not already and not failed:
+            lines.append("Nothing to load.")
 
-        await ctx.send("\n\n".join(lines) or "Nothing to load.")
+        await ctx.send("\n\n".join(lines))
 
     # ── info ──────────────────────────────────────────────────────────────────
 
@@ -559,12 +711,12 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
     @commands.is_owner()
     async def info(self, ctx: commands.Context, *, url: str):
         """
-        Show metadata about a package from GitHub without installing it.
-				
+        Show metadata about a package from GitHub without installing.
+
         Parameters
         ----------
         url: str
-            The GitHub repository URL or git+ URL of the package.
+            GitHub URL, git+ oe subdirectories.
         """
         msg = await ctx.send("Fetching package info…")
 
@@ -576,7 +728,9 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
             return
 
         already = package_exists(meta.path)
-        loaded = meta.path in self.bot.extensions
+        extension = meta.extension or discover_extension(meta.path)
+        loaded = extension in self.bot.extensions or meta.path in self.bot.extensions
+
         status_parts = []
         if already:
             status_parts.append("registered in `extra.toml`")
@@ -585,6 +739,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
         status = " • ".join(status_parts) if status_parts else "not installed"
 
         subdir_note = f"\n• Subdirectory: `{meta.subdir}`" if meta.subdir else ""
+        reload_cmd = f"`{settings.prefix}reload {extension}`"
 
         embed = discord.Embed(
             title=meta.name,
@@ -596,15 +751,16 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
             value=(
                 f"• Version: `{meta.version}`\n"
                 f"• Path: `{meta.path}`\n"
+                f"• Extension: `{extension}`\n"
                 f"• Repo: `{meta.repo_owner}/{meta.repo_name}`"
                 f"{subdir_note}\n"
+                f"• Reload: {reload_cmd}\n"
                 f"• Status: {status}"
             ),
             inline=False,
         )
         embed.add_field(name="Install URL", value=f"`{meta.raw_url}`", inline=False)
         if not already:
-            embed.set_footer(text=f"Run: {setting.prefix}package install {url}")
+            embed.set_footer(text=f"Run: {settings.prefix}package install {url}")
 
         await msg.edit(content=None, embed=embed)
- 
