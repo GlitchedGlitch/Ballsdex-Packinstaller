@@ -153,7 +153,7 @@ class UpdateSelectView(discord.ui.View):
 
 # ── Cog ───────────────────────────────────────────────────────────────────────
 
-class PackagesCog(commands.Cog):
+class PackagesCog(commands.Cog, name="PackInstaller"):
     """PackInstaller - manage BallsDex v3 packages from Discord."""
 
     def __init__(self, bot: "BallsDexBot"):
