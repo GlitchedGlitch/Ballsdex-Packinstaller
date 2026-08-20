@@ -16,8 +16,10 @@ from settings.models import settings
 from .github import (
     RateLimitError,
     VersionInfo,
+    build_update_url,
     check_versions,
     discover_extension,
+    extract_tag_from_location,
     uv_install,
     uv_reinstall,
     validate_and_fetch_meta,
@@ -224,7 +226,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
 
         await upd(1)
 
-        # extra.toml
+        # extra.toml 
         toml_written = False
         try:
             add_package(
@@ -237,7 +239,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
 
         await upd(2, success=toml_written)
 
-        # load extension
+        # Load extension
         extension = meta.extension or discover_extension(meta.path)
         try:
             await self.bot.load_extension(extension)
@@ -293,7 +295,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
         Parameters
         ----------
         package: str
-            The package path to remove.
+            The package path.
         """
         if not package_exists(package):
             await ctx.send(f"No package with path `{package}` found in `extra.toml`.")
@@ -309,7 +311,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
             steps[i] = (steps[i][0], success)
             await msg.edit(embed=_progress_embed("Removing package…", steps, discord.Color.blurple()))
 
-        # unload
+        # Unload 
         extension = discover_extension(package)
         for candidate in [extension, package]:
             try:
@@ -319,7 +321,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
                 pass
         await upd(0)
 
-        # remove
+        # Remove from extra.toml
         try:
             remove_package(package)
             await upd(1)
@@ -332,7 +334,10 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
         await msg.edit(
             embed=discord.Embed(
                 title="Package Removed",
-                description=(f"`{package}` unloaded and removed"),
+                description=(
+                    f"`{package}` unloaded and removed from `extra.toml`.\n\n"
+                    "Run `docker compose build` to purge venv files."
+                ),
                 color=discord.Color.red(),
             )
         )
@@ -349,7 +354,10 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
         """
         Interactive menu to select and update installed packages.
         """
-        packages = [p for p in read_packages() if p.get("location", "").startswith("git+https://github.com/")]
+        packages = [
+            p for p in read_packages()
+            if p.get("location", "").startswith("git+https://github.com/")
+        ]
         if not packages:
             await ctx.send("No GitHub-sourced packages registered in `extra.toml`.")
             return
@@ -371,7 +379,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
                 f"\n{len(gh_unavailable)} package(s) could not be checked (GitHub unavailable)."
                 if gh_unavailable else ""
             )
-            await ctx.send(f"All packages are up to date!{note}")
+            await ctx.send(f"All packages are up to date.{note}")
             return
 
         # Selection step
@@ -391,7 +399,10 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
 
         # Confirmation step
         selected_infos = [v for v in updates if v.path in select_view.selected]
-        conf_lines = [f"• **{v.path}** `{v.installed_tag}` -> `{v.latest_tag}`" for v in selected_infos]
+        conf_lines = [
+            f"• **{v.path}** `{v.installed_tag}` -> `{v.latest_tag}`"
+            for v in selected_infos
+        ]
         conf_embed = discord.Embed(
             title="Confirm Update",
             description="Update the following packages?\n\n" + "\n".join(conf_lines),
@@ -407,7 +418,6 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
 
         await select_msg.edit(embed=None, view=None, content="Updating packages…")
 
-        # Update 
         results: list[tuple[str, bool, str]] = []
 
         for info in selected_infos:
@@ -428,21 +438,21 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
                 s[i] = (s[i][0], success)
                 await m.edit(embed=_progress_embed(f"Updating {p}…", s, discord.Color.blurple()))
 
-            # Re-validate url
-            async with aiohttp.ClientSession() as session:
-                meta, err = await validate_and_fetch_meta(session, current_location)
+            # Build updated URL preserving #fragment and #subdirectory
+            # Uses build_update_url instead of re-validating via GitHub API
+            new_url = build_update_url(current_location, info.latest_tag)
 
-            if meta is None:
-                steps[0] = (steps[0][0], False)
-                await pkg_msg.edit(embed=_progress_embed(f"Update failed - {path}", steps, discord.Color.red()))
-                results.append((path, False, err))
-                continue
+            # Extract package name for --reinstall-package from the current meta
+            # (the project.name from pyproject.toml, not the path)
+            # Fall back to path if we can't determine it
+            pkg_name = path.replace("_", "-")
 
-            # Install
-            ok, output = await uv_reinstall(meta.raw_url, meta.name)
+            ok, output = await uv_reinstall(new_url, pkg_name)
             if not ok:
                 steps[0] = (steps[0][0], False)
-                await pkg_msg.edit(embed=_progress_embed(f"Update failed - {path}", steps, discord.Color.red()))
+                await pkg_msg.edit(
+                    embed=_progress_embed(f"Update failed — {path}", steps, discord.Color.red())
+                )
                 truncated = output[-800:] if len(output) > 800 else output
                 await ctx.send(f"`{path}` uv failed:\n```\n{truncated}\n```")
                 results.append((path, False, "uv pip install failed"))
@@ -450,23 +460,25 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
 
             await upd(0)
 
-            # Verify
-            extension = meta.extension or discover_extension(path)
+            # Verify: import the extension module to confirm install succeeded
+            extension = info.extension or discover_extension(path)
             try:
                 import importlib
                 importlib.import_module(extension)
                 await upd(1)
             except Exception as e:
                 steps[1] = (steps[1][0], False)
-                await pkg_msg.edit(embed=_progress_embed(f"Update failed - {path}", steps, discord.Color.red()))
+                await pkg_msg.edit(
+                    embed=_progress_embed(f"Update failed — {path}", steps, discord.Color.red())
+                )
                 results.append((path, False, f"Verification failed: {e}"))
                 continue
 
-            # Update file
+            # Update extra.toml location
             toml_updated = False
             try:
-                if meta.raw_url != current_location:
-                    update_package_location(path, meta.raw_url)
+                if new_url != current_location:
+                    update_package_location(path, new_url)
                 toml_updated = True
             except OSError:
                 pass
@@ -482,7 +494,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
             except Exception as e:
                 steps[3] = (steps[3][0], False)
                 await pkg_msg.edit(
-                    embed=_progress_embed(f"Partial update - {path}", steps, discord.Color.orange())
+                    embed=_progress_embed(f"Partial update — {path}", steps, discord.Color.orange())
                 )
                 results.append((path, False, f"Reload failed: {e}"))
                 log.warning(
@@ -491,7 +503,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
                 )
                 continue
 
-            not_persistent = "" if toml_updated else " *(runtime-only - extra.toml not writable)*"
+            not_persistent = "" if toml_updated else " *(extra.toml not writable)*"
             await pkg_msg.edit(
                 embed=discord.Embed(
                     title=f"{path} Updated",
@@ -510,12 +522,12 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
         success_count = sum(1 for _, ok, _ in results if ok)
         fail_count = len(results) - success_count
         summary_lines = [
-            f"{'✅' if ok else '❌'} **{p}** - {msg}"
-            for p, ok, msg in results
+            f"{'✅' if ok else '❌'} **{p}** — {m}"
+            for p, ok, m in results
         ]
         await ctx.send(
             embed=discord.Embed(
-                title=f"Update complete - {success_count} succeeded, {fail_count} failed",
+                title=f"Update complete — {success_count} succeeded, {fail_count} failed",
                 description="\n".join(summary_lines),
                 color=discord.Color.green() if not fail_count else discord.Color.orange(),
             )
@@ -527,7 +539,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
     @commands.is_owner()
     async def list_packages(self, ctx: commands.Context):
         """
-        List all installed packages with status.
+        List all installed packages.
         """
         packages = read_packages()
         if not packages:
@@ -536,8 +548,10 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
 
         msg = await ctx.send("Checking versions (may be cached)…")
 
-        # Check
-        gh_packages = [p for p in packages if p.get("location", "").startswith("git+https://github.com/")]
+        gh_packages = [
+            p for p in packages
+            if p.get("location", "").startswith("git+https://github.com/")
+        ]
         try:
             async with aiohttp.ClientSession() as session:
                 version_infos = await check_versions(session, gh_packages)
@@ -556,7 +570,6 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
             extension = discover_extension(path)
             loaded = extension in self.bot.extensions or path in self.bot.extensions
 
-            # Status
             if not enabled:
                 status = "⏸️"
             elif info and not info.github_available:
@@ -566,7 +579,6 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
             else:
                 status = "🔴"
 
-            # Version string
             if info:
                 if info.has_update:
                     ver = f"`{info.installed_tag}` -> `{info.latest_tag}`"
@@ -575,7 +587,6 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
                 else:
                     ver = f"`{info.installed_tag}`"
             elif location:
-                from .github import extract_tag_from_location
                 tag = extract_tag_from_location(location)
                 ver = f"`{tag}`" if tag else "`unknown`"
             else:
@@ -716,7 +727,7 @@ class PackagesCog(commands.Cog, name="PackInstaller"):
         Parameters
         ----------
         url: str
-            GitHub URL, git+ oe subdirectories.
+            GitHub URL, git+ or subdirectories.
         """
         msg = await ctx.send("Fetching package info…")
 
